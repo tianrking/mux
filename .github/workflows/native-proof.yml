@@ -1,0 +1,116 @@
+name: Isolated native proof
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: Immutable subject commit SHA
+        required: true
+      mode:
+        description: red, green, quality, or format
+        required: true
+        default: red
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(inputs.mode == 'green' && '{"os":["ubuntu-latest","macos-latest","windows-latest"],"go":["1.20.14","1.21.13"]}' || inputs.mode == 'quality' && '{"os":["ubuntu-latest"],"go":["1.20.14"]}' || '{"os":["ubuntu-latest"],"go":["1.21.13"]}') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          path: helper
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source }}
+          path: subject
+          persist-credentials: false
+      - name: Frozen source before tool setup
+        run: |
+          mkdir -p evidence
+          python helper/.github/native-proof.py subject evidence/00-before-setup.json
+          test "$(git -C subject rev-parse HEAD)" = "$SOURCE"
+        env:
+          SOURCE: ${{ inputs.source }}
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+      - name: Native commands and actual exits
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          ROOT="$PWD"
+          proof() { python "$ROOT/helper/.github/native-proof.py" "$ROOT/subject" "$ROOT/evidence/$1.json"; }
+          run() {
+            local name="$1"; shift
+            proof "$name-before"
+            set +e
+            "$@" 2>&1 | tee "$ROOT/evidence/$name.log"
+            local result=${PIPESTATUS[0]}
+            set -e
+            echo "$result" > "$ROOT/evidence/$name.exit"
+            proof "$name-after"
+            return "$result"
+          }
+          cd subject
+          go version | tee "$ROOT/evidence/go-version.txt"
+          go env -json > "$ROOT/evidence/go-env.json"
+          run package-resolution go list -test -json ./...
+          gofmt -l *.go > "$ROOT/evidence/gofmt-files.txt"
+          if [[ "$MODE" == format ]]; then
+            gofmt -d url_validation_test.go > "$ROOT/evidence/format.patch"
+            gofmt url_validation_test.go > "$ROOT/evidence/url_validation_test.go"
+            proof format-after
+          elif [[ "$MODE" == red ]]; then
+            result=0
+            run regression go test -count=1 -json -run '^TestURLBuilderAlternation' ./... || result=$?
+            test "$result" -eq 1
+            python - "$ROOT/evidence/regression.log" <<'PY'
+          import json, sys
+          events = [json.loads(line) for line in open(sys.argv[1]) if line.startswith('{')]
+          failures = [e['Test'] for e in events if e.get('Action') == 'fail' and 'Test' in e]
+          passes = [e['Test'] for e in events if e.get('Action') == 'pass' and 'Test' in e]
+          assert any('path_URL/alphax' in name for name in failures), failures
+          assert 'TestURLBuilderAlternationHTTPRoundTrip' in passes, passes
+          assert any('grouped_URL/alphax' in name for name in passes), passes
+          print(json.dumps({'failures': failures, 'passes': passes}, indent=2))
+          PY
+          elif [[ "$MODE" == green ]]; then
+            test ! -s "$ROOT/evidence/gofmt-files.txt"
+            run regression go test -count=1 -json -run '^TestURLBuilderAlternation' ./...
+            run full make test
+            run vet go vet ./...
+          elif [[ "$MODE" == quality ]]; then
+            # Versions match the project's v1.53 lint and 2023 security CI era.
+            failed=0
+            run install-lint go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.53.3 || failed=1
+            run install-gosec go install github.com/securego/gosec/v2/cmd/gosec@v2.16.0 || failed=1
+            run install-govulncheck go install golang.org/x/vuln/cmd/govulncheck@v1.0.1 || failed=1
+            test "$failed" -eq 0
+            go version -m "$(go env GOPATH)/bin/golangci-lint" > "$ROOT/evidence/lint-tool.txt"
+            go version -m "$(go env GOPATH)/bin/gosec" > "$ROOT/evidence/gosec-tool.txt"
+            go version -m "$(go env GOPATH)/bin/govulncheck" > "$ROOT/evidence/vuln-tool.txt"
+            run make-verify make verify || failed=1
+            run gosec make gosec || failed=1
+            run govulncheck make govulncheck || failed=1
+            exit "$failed"
+          else
+            echo "Unknown mode $MODE"; exit 2
+          fi
+      - name: Final immutable source proof
+        if: always()
+        run: python helper/.github/native-proof.py subject evidence/99-final.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: native-${{ inputs.mode }}-${{ matrix.os }}-${{ matrix.go }}
+          path: evidence
+          if-no-files-found: error
