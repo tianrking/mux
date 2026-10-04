@@ -18,7 +18,7 @@ jobs:
   native:
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(inputs.mode == 'green' && '{"os":["ubuntu-latest","macos-latest","windows-latest"],"go":["1.20.14","1.21.13"]}' || inputs.mode == 'quality' && '{"os":["ubuntu-latest"],"go":["1.20.14"]}' || '{"os":["ubuntu-latest"],"go":["1.21.13"]}') }}
+      matrix: ${{ fromJSON(inputs.mode == 'green' && '{"os":["ubuntu-latest","macos-latest","windows-latest"],"go":["1.20.14","1.21.13"]}' || inputs.mode == 'mac-baseline' && '{"os":["macos-latest"],"go":["1.21.13"]}' || inputs.mode == 'mac-green' && '{"os":["macos-14"],"go":["1.21.13"]}' || inputs.mode == 'quality' && '{"os":["ubuntu-latest"],"go":["1.20.14"]}' || '{"os":["ubuntu-latest"],"go":["1.21.13"]}') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     steps:
@@ -89,7 +89,16 @@ jobs:
           assert any('grouped_URL/alphax' in name for name in passes), passes
           print(json.dumps({'failures': failures, 'passes': passes}, indent=2))
           PY
-          elif [[ "$MODE" == green ]]; then
+          elif [[ "$MODE" == mac-baseline ]]; then
+            result=0
+            run original-all go test -count=1 -json ./... || result=$?
+            test "$result" -eq 1
+            grep -q 'missing LC_UUID' "$ROOT/evidence/original-all.log"
+            failed=0
+            run full make test || failed=1
+            run vet go vet ./... || failed=1
+            echo "$failed" > "$ROOT/evidence/remaining-exit.txt"
+          elif [[ "$MODE" == green || "$MODE" == mac-green ]]; then
             test ! -s "$ROOT/evidence/gofmt-files.txt"
             run regression go test -count=1 -json -run '^TestURLBuilderAlternation' ./...
             run full make test
