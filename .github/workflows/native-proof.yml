@@ -6,7 +6,7 @@ on:
         description: Immutable subject commit SHA
         required: true
       mode:
-        description: red, green, quality, or format
+        description: red, green, quality, format, or benchmark
         required: true
         default: red
 permissions:
@@ -31,6 +31,12 @@ jobs:
         with:
           ref: ${{ inputs.source }}
           path: subject
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        if: inputs.mode == 'benchmark'
+        with:
+          ref: db9d1d0073d27a0a2d9a8c1bc52aa0af4374d265
+          path: baseline
           persist-credentials: false
       - name: Frozen source before tool setup
         run: |
@@ -88,6 +94,16 @@ jobs:
             run regression go test -count=1 -json -run '^TestURLBuilderAlternation' ./...
             run full make test
             run vet go vet ./...
+          elif [[ "$MODE" == benchmark ]]; then
+            python "$ROOT/helper/.github/native-proof.py" "$ROOT/baseline" "$ROOT/evidence/base-before-resolution.json"
+            (cd "$ROOT/baseline" && go list -test -json ./...) > "$ROOT/evidence/base-package-resolution.log"
+            python "$ROOT/helper/.github/native-proof.py" "$ROOT/baseline" "$ROOT/evidence/base-after-resolution.json"
+            for round in 1 2 3; do
+              python "$ROOT/helper/.github/native-proof.py" "$ROOT/baseline" "$ROOT/evidence/base-$round-before.json"
+              (cd "$ROOT/baseline" && go test -run '^$' -bench '^BenchmarkNewRouter$' -benchmem -benchtime=1s -count=1 ./...) | tee "$ROOT/evidence/base-$round.log"
+              python "$ROOT/helper/.github/native-proof.py" "$ROOT/baseline" "$ROOT/evidence/base-$round-after.json"
+              run "fixed-$round" go test -run '^$' -bench '^BenchmarkNewRouter$' -benchmem -benchtime=1s -count=1 ./...
+            done
           elif [[ "$MODE" == quality ]]; then
             # Versions match the project's v1.53 lint and 2023 security CI era.
             failed=0
